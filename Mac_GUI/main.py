@@ -1,562 +1,501 @@
+#!/usr/bin/env python3
+# main.py — iOS Activation Bypass GUI (macOS, PyQt6) — Enhanced for PyInstaller & UX
+
 import sys
 import os
-import platform
+import re
 import time
-import shutil
-import traceback
 from pathlib import Path
-
+from typing import Optional, Dict, Any
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QProgressBar,
-    QVBoxLayout, QHBoxLayout, QWidget, QMessageBox, QFrame, QTextEdit
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QLabel, QLineEdit, QGroupBox,
+    QRadioButton, QButtonGroup, QMessageBox, QProgressBar, QFrame,
+    QScrollArea, QSizePolicy
 )
-from PyQt6.QtGui import QPixmap, QFont, QLinearGradient, QPainter, QColor
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings, QSize
+from PyQt6.QtGui import QFont, QTextCursor, QPalette, QColor, QPixmap, QIcon, QDragEnterEvent, QDropEvent
 
-
-def setup_app_environment():
-    """Configure environment for .app bundle"""
+# === Resource path helper for PyInstaller ===
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        if getattr(sys, 'frozen', False):
-            bundle_path = Path(sys.executable).parent.parent.parent
-            resources_path = bundle_path / 'Contents' / 'Resources'
-
-            if str(resources_path) not in sys.path:
-                sys.path.insert(0, str(resources_path))
-
-            bin_dir = resources_path / 'bin'
-            if bin_dir.exists():
-                new_path = str(bin_dir) + ':' + os.environ.get('PATH', '')
-                os.environ['PATH'] = new_path
-                print(f"🔧 Added to PATH: {bin_dir}")
-
-            os.chdir(resources_path)
-            print(f"🔧 Working directory: {os.getcwd()}")
-            return True
-    except Exception as e:
-        print(f"⚠️ Environment setup failed: {e}")
-    return False
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = Path(sys._MEIPASS)
+    except Exception:
+        base_path = Path(__file__).parent
+    return base_path / relative_path
 
 
-def setup_logging():
-    """Setup debug logging"""
-    try:
-        log_file = Path.home() / "Desktop" / "codex_app.log"
-        with open(log_file, 'w') as f:
-            f.write(f"=== Codex A12+ Log ===\n")
-            f.write(f"Time: {time.ctime()}\n")
-            f.write(f"Python: {sys.version}\n")
-            f.write(f"Working dir: {os.getcwd()}\n")
-            f.write(f"Frozen: {getattr(sys, 'frozen', False)}\n")
-            f.write(f"PATH: {os.environ.get('PATH', '')}\n")
-    except Exception as e:
-        print(f"⚠️ Logging setup failed: {e}")
-
-
-# Setup environment before imports
-setup_app_environment()
-setup_logging()
-
-# Import core logic
+# === CLI module import ===
 try:
-    from activator import BypassAutomation
-    print("✅ activator imported successfully")
-except Exception as e:
-    print(f"❌ Failed to import activator: {e}")
-    traceback.print_exc()
-    try:
-        app = QApplication(sys.argv)
-        QMessageBox.critical(
-            None,
-            "❌ Import Error",
-            f"Failed to import activator.py:\n{str(e)}\n\n"
-            f"Current dir: {os.getcwd()}\n"
-            f"Python path: {sys.path}"
-        )
-        sys.exit(1)
-    except:
-        sys.exit(1)
+    from activator_macos import log as original_log, run as original_run, validate_guid, run_cmd, find_binary
+except ImportError as e:
+    app = QApplication(sys.argv)  # temporary QApplication for dialog
+    QMessageBox.critical(None, "Import Error", f"Failed to import 'activator_macos.py':\n{e}\n\n"
+                                               "Ensure it's in the same directory.")
+    sys.exit(1)
 
 
-class WorkerThread(QThread):
-    log = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-    device_info = pyqtSignal(str, str, str)
-    progress = pyqtSignal(int)
+# === Thread-safe signal communication ===
+class SignalEmitter(QObject):
+    log_signal = pyqtSignal(str, str)
+    progress_signal = pyqtSignal(int)
+    success_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+    device_update_signal = pyqtSignal(dict)
+    stage_signal = pyqtSignal(str)
+
+
+emitter = SignalEmitter()
+
+
+def gui_log(msg: str, level='info'):
+    emitter.log_signal.emit(msg, level)
+    original_log(msg, level)
+
+
+# Patch the activator logger
+import activator_macos
+activator_macos.log = gui_log
+
+
+# === Worker thread ===
+class ActivatorWorker(QThread):
+    def __init__(self, auto: bool = False, guid: Optional[str] = None):
+        super().__init__()
+        self.auto = auto
+        self.guid = guid
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+        self.requestInterruption()
+
+    def _set_stage(self, stage_name: str):
+        emitter.stage_signal.emit(stage_name)
 
     def run(self):
         try:
-            self.log.emit("🔍 Verifying system requirements...")
-            automation = BypassAutomation(auto_confirm_guid=True)
-            automation.verify_dependencies()
+            if self._stopped:
+                return
 
-            self.log.emit("📱 Detecting device...")
-            automation.detect_device()
-            udid = automation.device_info.get('UniqueDeviceID', 'Unknown')
-            ios = automation.device_info.get('ProductVersion', 'Unknown')
-            product = automation.device_info.get('ProductType', 'Unknown')
-            self.device_info.emit(udid, ios, product)
+            # Progress through stage signals (approximate)
+            QTimer.singleShot(300, lambda: self._set_stage("detect"))
+            QTimer.singleShot(1000, lambda: self._set_stage("guid"))
+            QTimer.singleShot(4000, lambda: self._set_stage("download"))
+            QTimer.singleShot(9000, lambda: self._set_stage("upload"))
+            QTimer.singleShot(16000, lambda: self._set_stage("reboot"))
 
-            self.log.emit("🔑 Auto-detecting SystemGroup GUID (up to 5 attempts)...")
-            guid = automation.get_guid_auto()
-            if not guid:
-                self.log.emit("⚠ GUID detection failed — using fallback GUID")
-                guid = "00000000-0000-0000-0000-000000000000"
-            automation.guid = guid
-            self.log.emit(f"✅ Using GUID: {guid}")
+            original_run(auto=self.auto, preset_guid=self.guid)
 
-            self.log.emit("🌐 Requesting payload URLs from server...")
-            prd = automation.device_info['ProductType']
-            sn = automation.device_info['SerialNumber']
-            stage1_url, stage2_url, stage3_url = automation.get_all_urls_from_server(prd, guid, sn)
-            if not all([stage1_url, stage2_url, stage3_url]):
-                raise Exception("Server did not return all required URLs")
-
-            self.progress.emit(10)
-            self.log.emit("📥 Pre-loading Stage 1...")
-            automation.preload_stage("stage1", stage1_url)
-            self.progress.emit(20)
-            self.log.emit("📥 Pre-loading Stage 2...")
-            automation.preload_stage("stage2", stage2_url)
-            self.progress.emit(30)
-
-            self.log.emit("💾 Downloading final payload (Stage 3)...")
-            local_db = "downloads.28.sqlitedb"
-            if os.path.exists(local_db):
-                os.remove(local_db)
-            if not automation._curl_download(stage3_url, local_db):
-                raise Exception("Final payload download failed")
-
-            self.progress.emit(40)
-            self.log.emit("🔍 Validating payload database...")
-            import sqlite3
-            conn = sqlite3.connect(local_db)
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM asset")
-                count = cur.fetchone()[0]
-                if count == 0:
-                    raise Exception("Empty asset table — invalid payload")
-                self.log.emit(f"✅ Database valid: {count} assets found")
-            finally:
-                conn.close()
-            self.progress.emit(50)
-
-            self.log.emit("📤 Uploading payload to /Downloads/ via AFC...")
-            target = "/Downloads/downloads.28.sqlitedb"
-            if automation.afc_mode == "ifuse":
-                automation.mount_afc()
-                fpath = automation.mount_point + target
-                os.makedirs(os.path.dirname(fpath), exist_ok=True)
-                if os.path.exists(fpath):
-                    os.remove(fpath)
-                shutil.copy(local_db, fpath)
-                self.log.emit("✅ Uploaded via ifuse")
-            else:
-                automation._run_cmd(["pymobiledevice3", "afc", "rm", target])
-                code, _, err = automation._run_cmd(["pymobiledevice3", "afc", "push", local_db, target])
-                if code != 0:
-                    raise Exception(f"AFC upload failed: {err}")
-                self.log.emit("✅ Uploaded via pymobiledevice3")
-            self.progress.emit(65)
-
-            # Cleanup WAL/SHM
-            for wal_file in ["/Downloads/downloads.28.sqlitedb-wal", "/Downloads/downloads.28.sqlitedb-shm"]:
-                if automation.afc_mode == "ifuse":
-                    fpath = automation.mount_point + wal_file
-                    if os.path.exists(fpath):
-                        try:
-                            os.remove(fpath)
-                        except:
-                            pass
-                else:
-                    automation._run_cmd(["pymobiledevice3", "afc", "rm", wal_file])
-            self.log.emit("🧹 Cleaned up WAL/SHM files")
-
-            # === STAGE 1: FIRST REBOOT + COPY TO /Books/ ===
-            self.log.emit("🔄 Stage 1: Rebooting device...")
-            if not automation.reboot_device():
-                self.log.emit("⚠ First reboot failed — proceeding anyway")
-
-            self.log.emit("⏳ Waiting for iTunesMetadata.plist (max 25s)...")
-            if not automation.wait_for_file("/iTunes_Control/iTunes/iTunesMetadata.plist", timeout=25):
-                raise Exception("iTunesMetadata.plist not found after reboot")
-
-            self.log.emit("➡ Copying plist to /Books/iTunesMetadata.plist...")
-            if not automation.afc_copy(
-                "/iTunes_Control/iTunes/iTunesMetadata.plist",
-                "/Books/iTunesMetadata.plist"
-            ):
-                raise Exception("Failed to copy plist to /Books/")
-            self.log.emit("✅ Copied to /Books/")
-            self.progress.emit(75)
-
-            # === STAGE 2: SECOND REBOOT + COPY BACK ===
-            self.log.emit("🔄 Stage 2: Rebooting again to trigger bookassetd...")
-            if not automation.reboot_device():
-                self.log.emit("⚠ Second reboot failed — proceeding anyway")
-
-            self.log.emit("⏳ Waiting 15s for bookassetd processing...")
-            time.sleep(15)
-
-            self.log.emit("⬅ Copying plist back to /iTunes_Control/...")
-            if not automation.afc_copy(
-                "/Books/iTunesMetadata.plist",
-                "/iTunes_Control/iTunes/iTunesMetadata.plist"
-            ):
-                self.log.emit("⚠ Warning: copy-back failed — activation may still work")
-
-            self.log.emit("⏸ Waiting 20s for MobileActivation sync...")
-            time.sleep(20)
-            self.progress.emit(90)
-
-            # === FINAL REBOOT ===
-            self.log.emit("🔄 Final reboot to commit activation state...")
-            if automation.reboot_device():
-                self.log.emit("✅ Device rebooted — activation should complete shortly")
-            else:
-                self.log.emit("⚠ Final reboot failed — activation may still complete in background")
-
-            self.progress.emit(100)
-            self.finished.emit(True, "🎉 Activation process completed successfully!\n"
-                                    "Device should activate within 1–2 minutes.")
+            if not self._stopped:
+                self._set_stage("done")
+                emitter.success_signal.emit()
 
         except Exception as e:
-            error_msg = f"❌ {str(e)}"
-            print(f"💥 Worker error: {error_msg}")
-            traceback.print_exc()
-            self.log.emit(error_msg)
-            self.finished.emit(False, error_msg)
+            if not self._stopped:
+                emitter.error_signal.emit(str(e))
+        finally:
+            if not self._stopped:
+                emitter.progress_signal.emit(100)
 
 
+# === Device information panel ===
+class DeviceInfoPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setup_ui()
+        self.update_info()
+
+    def setup_ui(self):
+        layout = QHBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(16)
+
+        # Left side: status + image
+        img_container = QVBoxLayout()
+        img_container.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self.status_indicator = QLabel("●")
+        self.status_indicator.setFont(QFont("SF Mono", 18, QFont.Weight.Bold))
+        self.status_indicator.setStyleSheet("color: #999;")
+        img_container.addWidget(self.status_indicator, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.img_label = QLabel()
+        img_path = resource_path("assets/iphone.png")  # ✅ FIXED: uses resource_path
+        if img_path.exists():
+            pixmap = QPixmap(str(img_path))
+            size = 144  # увеличено
+            screen = QApplication.primaryScreen()
+            if screen:
+                size = int(144 * screen.devicePixelRatio())
+            pixmap = pixmap.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            self.img_label.setPixmap(pixmap)
+        else:
+            self.img_label.setText("📱\n\niPhone\n(not found)")
+            self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.img_label.setStyleSheet("font-size: 16px; color: #888; font-weight: bold;")
+
+        img_container.addWidget(self.img_label)
+        layout.addLayout(img_container)
+
+        # Right side: text
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(8)
+
+        title_label = QLabel("Device Information")
+        title_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        info_layout.addWidget(title_label)
+
+        self.model_label = QLabel("Model: —")
+        self.ios_label = QLabel("iOS: —")
+        self.activation_label = QLabel("Activation: —")
+        self.udid_label = QLabel("UDID: —")
+
+        for lbl in [self.model_label, self.ios_label, self.activation_label, self.udid_label]:
+            lbl.setFont(QFont("SF Mono, Menlo, monospace", 12))
+            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            info_layout.addWidget(lbl)
+
+        layout.addLayout(info_layout)
+        self.setLayout(layout)
+
+    def update_info(self, info: Optional[Dict[str, str]] = None):
+        if not info or not isinstance(info, dict):
+            info = {"ProductType": "—", "ProductVersion": "—", "ActivationState": "—", "UniqueDeviceID": "—"}
+
+        # Status
+        act = info.get("ActivationState", "").strip()
+        if act == "Activated":
+            self.status_indicator.setStyleSheet("color: #4caf50;")
+            self.status_indicator.setToolTip("✅ Activated")
+        elif act in ("Unactivated", "—"):
+            self.status_indicator.setStyleSheet("color: #ff9800;")
+            self.status_indicator.setToolTip("⚠ Not activated")
+        else:
+            self.status_indicator.setStyleSheet("color: #f44336;")
+            self.status_indicator.setToolTip("❌ Unknown")
+
+        # Model
+        model_map = {
+            "iPhone13,4": "iPhone 12 Pro Max",
+            "iPhone13,3": "iPhone 12 Pro",
+            "iPhone13,2": "iPhone 12",
+            "iPhone14,5": "iPhone 13",
+            "iPhone15,2": "iPhone 14 Pro",
+            "iPhone15,3": "iPhone 14 Pro Max",
+            "iPhone16,1": "iPhone 15 Pro",
+            "iPhone16,2": "iPhone 15 Pro Max",
+        }
+        code = info.get("ProductType", "Unknown")
+        name = model_map.get(code, code)
+        self.model_label.setText(f"<b>Model:</b> {name}")
+
+        # Other info
+        self.ios_label.setText(f"<b>iOS:</b> {info.get('ProductVersion', '—')}")
+
+        state = info.get("ActivationState", "—")
+        color = "#4caf50" if state == "Activated" else "#ff9800"
+        self.activation_label.setText(f'<span style="color:{color};"><b>Activation:</b> <b>{state}</b></span>')
+        self.activation_label.setTextFormat(Qt.TextFormat.RichText)
+
+        udid = info.get("UniqueDeviceID", "—")
+        # ✅ Показываем полный UDID, но делаем его переносимым
+        self.udid_label.setText(f"<b>UDID:</b> {udid}")
+        self.udid_label.setWordWrap(True)
+        self.udid_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+
+# === Main window ===
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Codex A12+ — Activation Tool")
-        self.setFixedSize(820, 560)
+        self.setWindowTitle("📱 iOS Activation Bypass (Rust505)")
+        self.resize(1024, 768)
+        self.thread = None
 
+        # ✅ QSettings — only after QApplication
+        self.settings = QSettings("Rust505", "iOSActivatorGUI")
+
+        # Device update timer
+        self._device_timer = QTimer()
+        self._device_timer.timeout.connect(self.detect_device)
+        self._device_timer.start(3000)
+
+        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
 
-        # === iPhone image panel ===
-        left = QLabel()
-        left.setFixedSize(320, 560)
-        left.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Device panel
+        device_frame = QFrame()
+        device_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        device_frame.setFrameShadow(QFrame.Shadow.Raised)
+        device_layout = QVBoxLayout(device_frame)
+        device_layout.addWidget(QLabel("📱 Connected Device"), alignment=Qt.AlignmentFlag.AlignLeft)
+        self.device_panel = DeviceInfoPanel()
+        device_layout.addWidget(self.device_panel)
+        main_layout.addWidget(device_frame)
 
-        # Try multiple paths for image
-        image_paths = [
-            "assets/iphone.png",
-            "iphone.png",
-            "../Resources/assets/iphone.png",
-            str(Path.home() / "Desktop" / "iphone.png")
-        ]
-        pixmap = None
-        for path in image_paths:
-            if os.path.exists(path):
-                p = QPixmap(path)
-                if not p.isNull():
-                    pixmap = p
-                    print(f"✅ Loaded image: {path}")
-                    break
+        # GUID mode
+        mode_group = QGroupBox("GUID Input Mode")
+        mode_group.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        mode_layout = QHBoxLayout()
+        self.radio_auto = QRadioButton("Auto-detect (recommended)")
+        self.radio_manual = QRadioButton("Manual input")
+        self.radio_auto.setChecked(True)
+        group = QButtonGroup()
+        group.addButton(self.radio_auto)
+        group.addButton(self.radio_manual)
+        mode_layout.addWidget(self.radio_auto)
+        mode_layout.addWidget(self.radio_manual)
+        mode_group.setLayout(mode_layout)
+        main_layout.addWidget(mode_group)
 
-        if pixmap and not pixmap.isNull():
-            left.setPixmap(pixmap.scaled(
-                280, 560,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            ))
-        else:
-            left.setText("📱\nCodex A12+\nActivation GUI")
-            left.setStyleSheet("color: #e0e0e0; font-size: 16px; font-weight: bold;")
-        layout.addWidget(left)
+        # GUID field
+        guid_layout = QHBoxLayout()
+        guid_layout.addWidget(QLabel("GUID:"), alignment=Qt.AlignmentFlag.AlignTop)
+        self.guid_edit = QLineEdit()
+        self.guid_edit.setPlaceholderText("e.g. 1A2B3C4D-1234-4123-8888-ABCDEF012345")
+        self.guid_edit.textChanged.connect(self._validate_guid)
+        self.guid_edit.setMaximumWidth(600)
+        self.guid_edit.setFont(QFont("SF Mono, Menlo, monospace", 12))
+        guid_layout.addWidget(self.guid_edit)
+        main_layout.addLayout(guid_layout)
 
-        # === Info & Control Panel ===
-        right = QWidget()
-        right.setFixedWidth(500)
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(40, 40, 40, 30)
-        right_layout.setSpacing(14)
-        layout.addWidget(right)
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("▶ Start Activation")
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.setEnabled(False)
+        self.start_btn.clicked.connect(self.start_activation)
+        self.stop_btn.clicked.connect(self.stop_activation)
+        self.start_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        self.stop_btn.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.stop_btn)
+        main_layout.addLayout(btn_layout)
 
-        title = QLabel("Codex A12+")
-        title.setFont(QFont("SF Pro Display", 28, QFont.Weight.Bold))
-        title.setStyleSheet("color: white;")
-        right_layout.addWidget(title)
-
-        subtitle = QLabel("Professional iOS Activation Bypass (A12+)")
-        subtitle.setFont(QFont("SF Pro Display", 13))
-        subtitle.setStyleSheet("color: #aaa;")
-        right_layout.addWidget(subtitle)
-
-        # Device info labels
-        self.udid_label = QLabel("📱 UDID: —")
-        self.ios_label = QLabel("🌐 iOS Version: —")
-        self.device_label = QLabel("📱 Device Model: —")
-        for lbl in [self.udid_label, self.ios_label, self.device_label]:
-            lbl.setFont(QFont("SF Pro", 12))
-            lbl.setStyleSheet("color: #ddd;")
-            right_layout.addWidget(lbl)
-
-        # Compatibility badge
-        compat = QLabel("✅ Compatible: A12, A13, A14, A15, A16, A17 devices")
-        compat.setFont(QFont("SF Pro", 11, QFont.Weight.Bold))
-        compat.setStyleSheet("color: #00d188;")
-        right_layout.addWidget(compat)
-
-        # Log output
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Menlo", 11))
-        self.log_view.setStyleSheet("""
-            QTextEdit {
-                background: #1e293b;
-                color: #e2e8f0;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
-        self.log_view.setFixedHeight(120)
-        right_layout.addWidget(self.log_view)
-
-        # Progress & status
+        # Progress
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(6)
+        self.progress.setFont(QFont("Segoe UI", 12))
         self.progress.setStyleSheet("""
             QProgressBar {
-                border: none;
-                background: #334155;
-                border-radius: 3px;
+                border: 2px solid #bbb;
+                border-radius: 5px;
+                text-align: center;
+                height: 24px;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4ade80, stop:1 #38bdf8);
-                border-radius: 3px;
+                background-color: #4caf50;
+                width: 20px;
             }
         """)
-        right_layout.addWidget(self.progress)
+        main_layout.addWidget(self.progress)
 
-        self.status_label = QLabel("🔌 Connect device and press Start")
-        self.status_label.setFont(QFont("SF Pro", 10))
-        self.status_label.setStyleSheet("color: #94a3b8;")
-        right_layout.addWidget(self.status_label)
-
-        # Start button
-        self.start_btn = QPushButton("🚀 Start Full Activation")
-        self.start_btn.setFont(QFont("SF Pro", 15, QFont.Weight.Bold))
-        self.start_btn.setFixedHeight(52)
-        self.start_btn.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0ea5e9, stop:1 #0284c7);
-                color: white;
-                border: none;
-                border-radius: 12px;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #0284c7, stop:1 #0369a1);
-            }
-            QPushButton:disabled {
-                background: #334155;
-                color: #64748b;
-            }
+        # Logs
+        log_group = QGroupBox("Logs")
+        log_group.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        log_layout = QVBoxLayout()
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("SF Mono, Menlo, Monaco, monospace", 11))
+        self.log_view.setStyleSheet("""
+            background: #1e1e1e;
+            color: #e0e0e0;
+            border: 1px solid #444;
+            padding: 8px;
+            font-size: 11pt;
         """)
-        self.start_btn.clicked.connect(self.start_activation)
-        right_layout.addWidget(self.start_btn)
+        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        log_layout.addWidget(self.log_view)
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
 
-        # Settings/about button
-        self.about_btn = QPushButton("ℹ️ About")
-        self.about_btn.setFixedSize(90, 32)
-        self.about_btn.setStyleSheet("""
-            QPushButton {
-                background: transparent;
-                color: #94a3b8;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                color: white;
-                border-color: #4ade80;
-            }
-        """)
-        self.about_btn.clicked.connect(self.show_about)
-        right_layout.addWidget(self.about_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        # Connect signals
+        emitter.log_signal.connect(self.append_log)
+        emitter.progress_signal.connect(self.progress.setValue)
+        emitter.success_signal.connect(self.on_success)
+        emitter.error_signal.connect(self.on_error)
+        emitter.device_update_signal.connect(self.device_panel.update_info)
+        emitter.stage_signal.connect(self._on_stage_change)
 
-        # Auto-refresh timer
-        self.check_timer = QTimer()
-        self.check_timer.timeout.connect(self.check_device)
-        self.check_timer.start(5000)
-        QTimer.singleShot(1000, self.check_device)
+        # Load last GUID (if exists)
+        last_guid = self.settings.value("last_guid", "")
+        if last_guid and validate_guid(last_guid):
+            self.guid_edit.setText(last_guid.upper())
 
-        self.worker = None
-        print("✅ MainWindow initialized")
+        # Check dependencies and update device
+        self._check_dependencies()
+        self.detect_device()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        grad = QLinearGradient(0, 0, self.width(), self.height())
-        grad.setColorAt(0.0, QColor("#0f172a"))  # slate-900
-        grad.setColorAt(0.5, QColor("#1e293b"))  # slate-800
-        grad.setColorAt(1.0, QColor("#334155"))  # slate-700
-        painter.fillRect(self.rect(), grad)
+    def _check_dependencies(self):
+        missing = [b for b in ['ideviceinfo', 'idevice_id', 'pymobiledevice3', 'curl'] if not find_binary(b)]
+        if missing:
+            msg = (
+                f"⚠ Missing tools: {', '.join(missing)}\n\n"
+                "Install with:\n"
+                "  brew install libimobiledevice\n"
+                "  pip3 install pymobiledevice3"
+            )
+            QMessageBox.critical(self, "Dependency Error", msg)
+            self.start_btn.setEnabled(False)
 
-    def log(self, msg: str):
-        self.log_view.append(msg)
-        self.log_view.verticalScrollBar().setValue(
-            self.log_view.verticalScrollBar().maximum()
-        )
+    def _validate_guid(self):
+        text = self.guid_edit.text().strip()
+        valid = bool(text and validate_guid(text.upper()))
+        self.guid_edit.setStyleSheet("" if valid else "background: #ffebee;" if len(text) > 8 else "")
 
-    def check_device(self):
+    def detect_device(self):
+        if self.thread and self.thread.isRunning():
+            return
         try:
-            auto = BypassAutomation(auto_confirm_guid=True)
-
-            # Test ideviceinfo
-            code, _, err = auto._run_cmd(["ideviceinfo", "--version"])
-            if code != 0:
-                self.status_label.setText("❌ ideviceinfo not available")
-                self.start_btn.setEnabled(False)
-                self.log("❌ ideviceinfo not found or failed")
-                return
-
-            # List devices
-            code, out, err = auto._run_cmd(["idevice_id", "-l"])
-            if code != 0 or not out.strip():
-                self.status_label.setText("🔌 No device detected — connect & trust")
-                self.start_btn.setEnabled(False)
-                self.log("⏳ Waiting for USB device...")
-                return
-
-            udid = out.strip().split('\n')[0]
-            code, out, _ = auto._run_cmd(["ideviceinfo", "-u", udid])
+            code, out, _ = run_cmd(["ideviceinfo"], timeout=5)
+            info = {}
             if code == 0:
-                info = {}
                 for line in out.splitlines():
                     if ": " in line:
                         k, v = line.split(": ", 1)
                         info[k.strip()] = v.strip()
-
-                udid_short = info.get('UniqueDeviceID',)[:35] + "..."
-                self.udid_label.setText(f"📱 UDID: {udid_short}")
-                self.ios_label.setText(f"🌐 iOS: {info.get('ProductVersion', '?')}")
-                self.device_label.setText(f"📱 Device: {info.get('ProductType', '?')}")
-                self.status_label.setText("✅ Device ready — click Start to begin")
-                self.start_btn.setEnabled(True)
-                self.log("✅ Device detected and ready")
-            else:
-                self.status_label.setText("❌ Failed to read device info")
-                self.start_btn.setEnabled(False)
-                self.log("❌ ideviceinfo command failed")
-
+                # UDID
+                udid_code, udid_out, _ = run_cmd(["idevice_id", "-l"], timeout=3)
+                if udid_code == 0:
+                    info["UniqueDeviceID"] = udid_out.strip() or "—"
+            emitter.device_update_signal.emit(info)
         except Exception as e:
-            self.udid_label.setText("📱 UDID: —")
-            self.ios_label.setText("🌐 iOS Version: —")
-            self.device_label.setText("📱 Device Model: —")
-            self.status_label.setText("❌ Error during device check")
-            self.start_btn.setEnabled(False)
-            self.log(f"❌ Device check error: {e}")
+            emitter.device_update_signal.emit({})
+
+    def _on_stage_change(self, stage: str):
+        labels = {
+            "detect": "🔍 Detecting device...",
+            "guid": "📡 Extracting GUID...",
+            "download": "📥 Downloading payload...",
+            "upload": "📤 Uploading to /Downloads/...",
+            "reboot": "🔄 Rebooting (×3)...",
+            "done": "✅ Done!",
+        }
+        self.progress.setFormat(labels.get(stage, stage))
 
     def start_activation(self):
-        if self.worker and self.worker.isRunning():
+        if self.thread and self.thread.isRunning():
             return
 
+        auto = self.radio_auto.isChecked()
+        guid = self.guid_edit.text().strip().upper() if self.radio_manual.isChecked() else None
+
+        if self.radio_manual.isChecked():
+            if not guid:
+                QMessageBox.warning(self, "Input Required", "GUID field is empty.")
+                return
+            if not validate_guid(guid):
+                QMessageBox.warning(self, "Invalid GUID", "GUID must be UUID v4 (e.g. XXXXXXXX-XXXX-4XXX-YXXX-XXXXXXXXXXXX).")
+                return
+
         self.log_view.clear()
+        self.append_log("🚀 Starting activation process...", "info")
         self.start_btn.setEnabled(False)
-        self.start_btn.setText("⚡ Running Activation...")
+        self.stop_btn.setEnabled(True)
         self.progress.setValue(0)
-        self.status_label.setText("⚙️ Initializing bypass engine...")
+        self.progress.setFormat("Initializing...")
 
-        self.worker = WorkerThread()
-        self.worker.log.connect(self.log)
-        self.worker.device_info.connect(self.update_device_info)
-        self.worker.progress.connect(self.progress.setValue)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.start()
+        self.thread = ActivatorWorker(auto=auto, guid=guid)
+        self.thread.finished.connect(self._on_thread_finished)
+        self.thread.start()
 
-    def update_device_info(self, udid, ios, product):
-        self.udid_label.setText(f"📱 UDID: {udid[:12]}...")
-        self.ios_label.setText(f"🌐 iOS: {ios}")
-        self.device_label.setText(f"📱 Device: {product}")
+    def stop_activation(self):
+        if self.thread and self.thread.isRunning():
+            self.append_log("⏹ Stop requested...", "warn")
+            self.thread.stop()
+            self.thread.wait(2000)
+            if self.thread.isRunning():
+                self.thread.terminate()
+                self.append_log("⚠ Thread forcibly terminated.", "error")
+            self._on_thread_finished()
 
-    def on_finished(self, success, msg):
+    def _on_thread_finished(self):
         self.start_btn.setEnabled(True)
-        self.start_btn.setText("🚀 Start Full Activation")
-        if success:
-            QMessageBox.information(
-                self, "✅ Success",
-                "Activation process completed successfully!\n\n"
-            )
-            self.status_label.setText("✅ Done — activation in progress")
-            self.log("🎉 Activation completed successfully")
-        else:
-            QMessageBox.critical(
-                self, "❌ Activation Failed",
-                f"Error: {msg}\n\n"
-                "Troubleshooting:\n"
-                "• Ensure device is trusted and unlocked\n"
-                "• Close iTunes/Finder\n"
-                "• Use high-quality USB cable\n"
-                "• Device must be in normal (not DFU/recovery) mode\n"
-                "• Check Desktop/codex_app.log for details"
-            )
-            self.status_label.setText("❌ Activation failed")
-            self.log("❌ Activation failed — see error above")
+        self.stop_btn.setEnabled(False)
 
-    def show_about(self):
-        QMessageBox.about(
-            self, "ℹ️ About Codex A12+",
-            "<h3>Codex A12+ — iOS Activation Bypass Tool</h3>"
-            "<p><b>Version:</b> 2.1 (GUI — Full Auto)</p>"
-            "<p><b>Features:</b></p>"
-            "<ul>"
-            "<li>✅ Full auto GUID detection (no manual input)</li>"
-            "<li>✅ Supports ifuse & pymobiledevice3 backends</li>"
-            "<li>✅ A12–A17 device support</li>"
-            "<li>✅ Built-in SSL bypass (<code>-k</code>)</li>"
-            "</ul>"
-            f"<p><b>Bundle Mode:</b> {'Yes' if getattr(sys, 'frozen', False) else 'No'}</p>"
-            f"<p><b>Working Dir:</b> {os.getcwd()}</p>"
-            "<p><i>For research and educational purposes only.</i></p>"
-            "<p>© Codex Team — Developed by Rustam Asadov (Rust505)</p>"
-        )
+    def append_log(self, msg: str, level='info'):
+        colors = {
+            'success': '#4caf50',
+            'error': '#f44336',
+            'warn': '#ff9800',
+            'step': '#2196f3',
+            'info': '#64b5f6',
+            'detail': '#90a4ae'
+        }
+        color = colors.get(level, '#e0e0e0')
+        ts = time.strftime("%H:%M:%S")
+        html = f'<span style="color:#78909c;">[{ts}]</span> <span style="color:{color};">{msg}</span><br>'
+        self.log_view.append(html)
+        self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.log_view.ensureCursorVisible()
+
+    def on_success(self):
+        self.append_log("🎉 ACTIVATION SUCCESSFUL!", "success")
+        # Save GUID
+        guid = self.guid_edit.text().strip().upper()
+        if guid and validate_guid(guid):
+            self.settings.setValue("last_guid", guid)
+        QMessageBox.information(self, "Success", "✅ Activation bypass completed!\n\n"
+                                                 "📌 Thanks Rust505 and rhcp011235")
+        self.detect_device()
+
+    def on_error(self, err: str):
+        self.append_log(f"❌ Fatal: {err}", "error")
+        QMessageBox.critical(self, "Activation Failed", f"Process terminated with error:\n\n<b>{err}</b>")
 
 
-def main():
+# === Theme and icon ===
+def enable_dark_mode(app: QApplication):
     try:
-        print("🚀 Starting Codex A12+ GUI...")
-        Path("assets").mkdir(exist_ok=True)
+        import subprocess
+        res = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                             capture_output=True, text=True)
+        is_dark = res.returncode == 0 and "Dark" in res.stdout
+    except:
+        is_dark = True
 
-        app = QApplication(sys.argv)
-        if platform.system() == "Darwin":
-            app.setStyle("macos")
-            app.setFont(QFont("SF Pro Display", 13))
-
-        window = MainWindow()
-        window.show()
-        print("✅ Application started")
-        return app.exec()
-
-    except Exception as e:
-        print(f"💥 Fatal startup error: {e}")
-        traceback.print_exc()
-        try:
-            app = QApplication(sys.argv)
-            QMessageBox.critical(
-                None,
-                "❌ Startup Error",
-                f"Codex A12+ failed to start:\n{str(e)}\n\n"
-                "Check Desktop/codex_app.log for diagnostics."
-            )
-        except:
-            pass
-        return 1
+    if is_dark:
+        app.setStyle("Fusion")
+        p = QPalette()
+        p.setColor(QPalette.ColorRole.Window, QColor(38, 38, 38))
+        p.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Base, QColor(28, 28, 28))
+        p.setColor(QPalette.ColorRole.AlternateBase, QColor(48, 48, 48))
+        p.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.Button, QColor(68, 68, 68))
+        p.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+        p.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+        p.setColor(QPalette.ColorRole.Link, QColor(40, 140, 240))
+        p.setColor(QPalette.ColorRole.Highlight, QColor(40, 140, 240))
+        p.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        app.setPalette(p)
 
 
+def set_app_icon(app: QApplication):
+    icon_path = resource_path("assets/app_icon.icns")  # ✅ FIXED: uses resource_path
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
+
+# === Entry point ===
 if __name__ == "__main__":
-    sys.exit(main())
+    app = QApplication(sys.argv)
+    app.setApplicationName("iOS Activation Bypass")
+    app.setOrganizationName("Rust505")
+    enable_dark_mode(app)
+    set_app_icon(app)
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
